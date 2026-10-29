@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: complaint-bot
+    runtime: docker
+    plan: starter          # ⚠️ для постоянного диска нужен платный план
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: MAX_ACCOUNTS
+        value: 10
+    disks:
+      - name: bot-data
+        mountPath: /data
+        sizeGB: 1
