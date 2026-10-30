@@ -730,14 +730,22 @@ async def main():
     log.info("БД готова. Запускаю polling…")
 
     await bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("add_account", "Подключить аккаунт"),
-        BotCommand("list_accounts", "Мои аккаунты"),
-        BotCommand("remove_account", "Удалить аккаунт"),
-        BotCommand("complain", "Подать жалобу"),
-        BotCommand("history", "История жалоб"),
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="add_account", description="Подключить аккаунт"),
+        BotCommand(command="list_accounts", description="Мои аккаунты"),
+        BotCommand(command="remove_account", description="Удалить аккаунт"),
+        BotCommand(command="complain", description="Подать жалобу"),
+        BotCommand(command="history", description="История жалоб"),
     ])
 
+    task = asyncio.create_task(clean_pending_loop())
+    try:
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    finally:
+        task.cancel()
+        for key in list(pending):
+            await drop_pending(*key)
+        await bot.session.close()
     task = asyncio.create_task(clean_pending_loop())
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
