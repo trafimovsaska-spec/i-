@@ -1,20 +1,21 @@
 import asyncio
 import html
 import logging
+import os
 import random
 import re
 import time
 from dataclasses import dataclass, field
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, TelegramObject
+from aiogram.types import Message, CallbackQuery, TelegramObject, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import BotCommand, BotCommandScopeDefault
 
 from pyrogram import Client
 from pyrogram.errors import (
@@ -41,17 +42,69 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 # ------------------------------------------------------------------
-# Причины жалоб
+# Причины жалоб + шаблоны текстов
 # ------------------------------------------------------------------
 REASONS = {
-    "spam":               ("📨 Спам", types.InputReportReasonSpam),
-    "violence":           ("💪 Насилие", types.InputReportReasonViolence),
-    "pornography":        ("🔞 Порнография", types.InputReportReasonPornography),
-    "child_abuse":        ("🧒 Жестокое обращение с детьми", types.InputReportReasonChildAbuse),
-    "illegal_drugs":      ("💊 Незаконные наркотики", types.InputReportReasonIllegalDrugs),
-    "personal_details":   ("👤 Личные данные", types.InputReportReasonPersonalDetails),
-    "copyright":          ("©️ Авторские права", types.InputReportReasonCopyright),
-    "other":              ("❓ Другое", types.InputReportReasonOther),
+    "spam":             ("📨 Спам", types.InputReportReasonSpam),
+    "violence":         ("💪 Насилие", types.InputReportReasonViolence),
+    "pornography":      ("🔞 Порнография", types.InputReportReasonPornography),
+    "child_abuse":      ("🧒 Жестокое обращение с детьми", types.InputReportReasonChildAbuse),
+    "illegal_drugs":    ("💊 Незаконные наркотики", types.InputReportReasonIllegalDrugs),
+    "personal_details": ("👤 Личные данные", types.InputReportReasonPersonalDetails),
+    "copyright":        ("©️ Авторские права", types.InputReportReasonCopyright),
+    "other":            ("❓ Другое", types.InputReportReasonOther),
+}
+
+# Шаблоны текстов для каждой причины
+REASON_TEMPLATES = {
+    "spam": [
+        "Аккаунт массово рассылает рекламные сообщения и спам.",
+        "Рассылка фишинговых ссылок с целью обмана пользователей.",
+        "Автоматизированная рассылка нежелательных сообщений.",
+        "Навязчивая реклама запрещённых товаров и услуг.",
+    ],
+    "violence": [
+        "Пропаганда насилия и призывы к жестокости.",
+        "Угрозы физической расправы в адрес пользователей.",
+        "Публикация материалов, оправдывающих терроризм.",
+        "Разжигание ненависти и призывы к насилию.",
+    ],
+    "pornography": [
+        "Публикация порнографического контента без предупреждения.",
+        "Распространение запрещённого порнографического материала.",
+        "Незаконный эротический контент в открытом доступе.",
+        "Порнографический контент, нарушающий правила платформы.",
+    ],
+    "child_abuse": [
+        "Подозрительный контент с участием несовершеннолетних.",
+        "Материалы, эксплуатирующие детей.",
+        "Попытки вовлечения несовершеннолетних в опасную деятельность.",
+        "Контент сексуального характера с участием детей.",
+    ],
+    "illegal_drugs": [
+        "Пропаганда и продажа запрещённых наркотических веществ.",
+        "Инструкции по изготовлению наркотиков.",
+        "Реклама наркотических средств и психотропных веществ.",
+        "Координация распространения запрещённых препаратов.",
+    ],
+    "personal_details": [
+        "Публикация персональных данных без согласия человека.",
+        "Распространение чужих телефонов, адресов и документов.",
+        "Доксинг — публикация личной информации с целью травли.",
+        "Утечка конфиденциальных данных третьих лиц.",
+    ],
+    "copyright": [
+        "Нарушение авторских прав, распространение пиратского контента.",
+        "Незаконное использование чужих материалов без разрешения.",
+        "Публикация защищённого авторским правом контента.",
+        "Плагиат и выдача чужих работ за свои.",
+    ],
+    "other": [
+        "Сообщение нарушает правила Telegram и пользовательское соглашение.",
+        "Данный контент противоречит условиям использования платформы.",
+        "Мошенничество и введение пользователей в заблуждение.",
+        "Координация незаконной деятельности.",
+    ],
 }
 
 STATUS_TEXT = {
@@ -78,12 +131,13 @@ class Report(StatesGroup):
     multi_account = State()
     link = State()
     reason = State()
-    comment = State()
+    template_choice = State()   # НОВОЕ: выбор шаблона
+    custom_comment = State()    # НОВОЕ: ввод своего текста
     confirm = State()
 
 
 # ------------------------------------------------------------------
-# Очереди входа (живут в памяти только на время авторизации)
+# Очереди входа
 # ------------------------------------------------------------------
 @dataclass
 class PendingLogin:
@@ -137,12 +191,10 @@ def parse_link(link: str) -> tuple[str, int] | None:
         link = link[m.end():]
     link = link.lstrip("/")
 
-    # t.me/c/123456789/42  (приватный канал)
     m = re.match(r"^c/(\d+)/(\d+)", link)
     if m:
         return f"-100{m.group(1)}", int(m.group(2))
 
-    # t.me/username/42  или  t.me/username/42?comment=...
     m = re.match(r"^([A-Za-z][A-Za-z0-9_]{4,31})/(\d+)", link)
     if m:
         return m.group(1), int(m.group(2))
@@ -153,7 +205,6 @@ def parse_link(link: str) -> tuple[str, int] | None:
 def make_reason(key: str, comment: str):
     cls = REASONS[key][1]
     if key == "other":
-        # В разных версиях TL-схем у Other поле text есть / нет
         try:
             return cls(text=comment or "Нарушение правил Telegram")
         except TypeError:
@@ -180,6 +231,27 @@ async def clean_pending_loop():
 
 
 # ------------------------------------------------------------------
+# Веб-сервер для Render (Health Check)
+# ------------------------------------------------------------------
+async def health_check(request):
+    return web.Response(text="OK", status=200)
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Веб-сервер запущен на порту {port}")
+    return runner
+
+
+# ------------------------------------------------------------------
 # Старт / справка
 # ------------------------------------------------------------------
 @dp.message(Command("start", "help"))
@@ -200,7 +272,7 @@ async def cmd_start(message: Message):
 
 
 # ------------------------------------------------------------------
-# Добавление аккаунта: ШАГ 1 — телефон
+# Добавление аккаунта
 # ------------------------------------------------------------------
 @dp.message(Command("add_account"))
 async def cmd_add_account(message: Message, state: FSMContext):
@@ -212,8 +284,7 @@ async def cmd_add_account(message: Message, state: FSMContext):
         "📱 <b>Подключение аккаунта</b>\n\n"
         "Отправь номер этого аккаунта в международном формате:\n"
         "<code>+79991234567</code>\n\n"
-        "❗ Код придёт <b>в приложение Telegram</b> на этот номер "
-        "(или по SMS, если Telegram не подключён)."
+        "❗ Код придёт <b>в приложение Telegram</b> на этот номер."
     )
     await state.set_state(Auth.phone)
 
@@ -246,7 +317,7 @@ async def auth_phone(message: Message, state: FSMContext):
         return
     except FloodWait as e:
         await client.disconnect()
-        await message.answer(f"🕒 Слишком много запросов. Подожди {e.value} сек. и повтори /add_account")
+        await message.answer(f"🕒 Слишком много запросов. Подожди {e.value} сек.")
         await state.clear()
         return
     except Exception as e:
@@ -262,9 +333,6 @@ async def auth_phone(message: Message, state: FSMContext):
     await message.answer("📩 Код отправлен. Пришли его цифрами (например: <code>48291</code>).")
 
 
-# ------------------------------------------------------------------
-# Добавление аккаунта: ШАГ 2 — код
-# ------------------------------------------------------------------
 @dp.message(Auth.code)
 async def auth_code(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -307,10 +375,10 @@ async def auth_code(message: Message, state: FSMContext):
             "Пришли <b>облачный пароль</b>, не код."
         )
         return
-    except (PhoneCodeInvalid, PhoneCodeExpired) as e:
+    except (PhoneCodeInvalid, PhoneCodeExpired):
         await drop_pending(owner, phone)
         await state.clear()
-        await message.answer(f"❌ {type(e).__name__}. Начни заново: /add_account")
+        await message.answer("❌ Неверный или устаревший код. Начни заново: /add_account")
         return
     except Exception as e:
         await drop_pending(owner, phone)
@@ -321,9 +389,6 @@ async def auth_code(message: Message, state: FSMContext):
     await finish_login(message, state, owner, phone, item.client)
 
 
-# ------------------------------------------------------------------
-# Добавление аккаунта: ШАГ 3 — 2FA (если нужно)
-# ------------------------------------------------------------------
 @dp.message(Auth.password)
 async def auth_password(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -541,7 +606,7 @@ async def report_link(message: Message, state: FSMContext):
 
 
 # ------------------------------------------------------------------
-# Жалоба: причина + комментарий
+# Жалоба: причина + шаблоны
 # ------------------------------------------------------------------
 @dp.callback_query(Report.reason, F.data.startswith("reason:"))
 async def report_reason(callback: CallbackQuery, state: FSMContext):
@@ -549,18 +614,70 @@ async def report_reason(callback: CallbackQuery, state: FSMContext):
     if key not in REASONS:
         await callback.answer()
         return
+    
     await state.update_data(reason_key=key)
-    await state.set_state(Report.comment)
+    
+    # Показываем шаблоны
+    templates = REASON_TEMPLATES.get(key, [])
+    kb = InlineKeyboardBuilder()
+    
+    for i, template in enumerate(templates):
+        # Обрезаем длинные шаблоны для кнопки
+        short_text = template[:50] + "..." if len(template) > 50 else template
+        kb.button(text=short_text, callback_data=f"tpl:{i}")
+    
+    kb.button(text="✏️ Написать свой текст", callback_data="tpl:custom")
+    kb.button(text="⏭️ Без комментария", callback_data="tpl:none")
+    kb.adjust(1)
+    
+    await state.set_state(Report.template_choice)
+    
+    templates_text = "\n".join([f"{i+1}. {t}" for i, t in enumerate(templates)])
+    
     await callback.message.answer(
-        f"Причина: {REASONS[key][0]}\n\n"
-        "Напиши комментарий к жалобе.\n"
-        "Или отправь <code>0</code>, чтобы без комментария."
+        f"<b>Причина:</b> {REASONS[key][0]}\n\n"
+        f"<b>Выбери шаблон жалобы:</b>\n{templates_text}",
+        reply_markup=kb.as_markup()
     )
     await callback.answer()
 
 
-@dp.message(Report.comment)
-async def report_comment(message: Message, state: FSMContext):
+@dp.callback_query(Report.template_choice, F.data.startswith("tpl:"))
+async def report_template(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    reason_key = data.get("reason_key")
+    templates = REASON_TEMPLATES.get(reason_key, [])
+    
+    if action == "custom":
+        await state.set_state(Report.custom_comment)
+        await callback.message.answer(
+            "✏️ Напиши свой текст жалобы (до 512 символов):"
+        )
+        await callback.answer()
+        return
+    
+    if action == "none":
+        await state.update_data(comment="")
+        await show_confirm(callback.message, state)
+        await callback.answer()
+        return
+    
+    # Выбран шаблон
+    try:
+        index = int(action)
+        if 0 <= index < len(templates):
+            comment = templates[index]
+            await state.update_data(comment=comment)
+            await show_confirm(callback.message, state)
+    except (ValueError, IndexError):
+        pass
+    
+    await callback.answer()
+
+
+@dp.message(Report.custom_comment)
+async def report_custom_comment(message: Message, state: FSMContext):
     text = message.text.strip()
     comment = "" if text == "0" else text[:512]
     await state.update_data(comment=comment)
@@ -669,16 +786,16 @@ async def send_reports(callback: CallbackQuery, state: FSMContext):
                     )
                     status = "success" if result else "failed"
                 else:
-                    status, detail = "flood", f"ждати {e.value}с"
+                    status, detail = "flood", f"ждать {e.value}с"
 
         except (Unauthorized, TypeError, ValueError) as e:
             status = "invalid"
             detail = type(e).__name__
             await mark_invalid(owner, phone)
-        except (PeerIdInvalid, UsernameNotOccupied) as e:
+        except (PeerIdInvalid, UsernameNotOccupied):
             status, detail = "error", "нет доступа к чату/сообщению"
         except FloodWait as e:
-            status, detail = "flood", f"ждати {e.value}с"
+            status, detail = "flood", f"ждать {e.value}с"
         except RPCError as e:
             status, detail = "error", f"{e.MESSAGE}"
         except Exception as e:
@@ -693,14 +810,12 @@ async def send_reports(callback: CallbackQuery, state: FSMContext):
         await save_complaint(owner, phone, target, reason_label, comment, status)
         lines.append(f"{phone}: {STATUS_TEXT.get(status, status)}" + (f" ({detail})" if detail else ""))
 
-        # Отдаём прогресс
-        await msg.answer(f"📊 Прогресс:\n" + "\n".join(lines))
+        await msg.edit_text(f"📊 Прогресс:\n" + "\n".join(lines))
 
-        # Пауза перед следующим аккаунтом
         if phone != selected[-1]:
             await asyncio.sleep(random.uniform(4.0, 9.0))
 
-    await msg.answer("🏁 <b>Готово</b>\n\n" + "\n".join(lines))
+    await msg.edit_text("🏁 <b>Готово</b>\n\n" + "\n".join(lines))
 
 
 # ------------------------------------------------------------------
@@ -727,7 +842,7 @@ async def cmd_history(message: Message):
 # ------------------------------------------------------------------
 async def main():
     await init_db()
-    log.info("БД готова. Запускаю polling…")
+    log.info("БД готова. Запускаю polling и веб-сервер…")
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
@@ -738,7 +853,12 @@ async def main():
         BotCommand(command="history", description="История жалоб"),
     ])
 
+    # Запускаем веб-сервер
+    web_runner = await start_web_server()
+    
+    # Запускаем очистку pending логинов
     task = asyncio.create_task(clean_pending_loop())
+    
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
@@ -746,14 +866,7 @@ async def main():
         for key in list(pending):
             await drop_pending(*key)
         await bot.session.close()
-    task = asyncio.create_task(clean_pending_loop())
-    try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-    finally:
-        task.cancel()
-        for key in list(pending):
-            await drop_pending(*key)
-        await bot.session.close()
+        await web_runner.cleanup()
 
 
 if __name__ == "__main__":
