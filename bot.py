@@ -51,7 +51,6 @@ REASONS = {
     "illegal_drugs":      ("💊 Незаконные наркотики", types.InputReportReasonIllegalDrugs),
     "personal_details":   ("👤 Личные данные", types.InputReportReasonPersonalDetails),
     "copyright":          ("©️ Авторские права", types.InputReportReasonCopyright),
-    "geo":                ("🌍 Географические ограничения", types.InputReportReasonGeoRestricted),
     "other":              ("❓ Другое", types.InputReportReasonOther),
 }
 
