@@ -5,8 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Устанавливаем gcc для компиляции tgcrypto
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
